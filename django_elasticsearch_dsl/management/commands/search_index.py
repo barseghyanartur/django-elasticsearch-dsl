@@ -4,6 +4,11 @@ from django.utils.six.moves import input
 from ...registries import registry
 
 
+ALLOWED_UPDATE_KWARGS = (
+    'chunk_size',
+)
+
+
 class Command(BaseCommand):
     help = 'Manage elasticsearch index.'
 
@@ -49,6 +54,13 @@ class Command(BaseCommand):
             dest='force',
             help="Force operations without asking"
         )
+        parser.add_argument(
+            '--chunk-size',
+            metavar='chunk_size',
+            type=int,
+            nargs='*',
+            help="Chunk size for bulk insert/update."
+        )
 
     def _get_models(self, args):
         """
@@ -89,7 +101,8 @@ class Command(BaseCommand):
             self.stdout.write("Indexing {} '{}' objects".format(
                 qs.count(), doc._doc_type.model.__name__)
             )
-            doc().update(qs)
+            update_kwargs = {key: options[key] for key in ALLOWED_UPDATE_KWARGS}
+            doc().update(qs, **update_kwargs)
 
     def _delete(self, models, options):
         index_names = [str(index) for index in registry.get_indices(models)]
