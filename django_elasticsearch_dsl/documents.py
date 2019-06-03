@@ -1,16 +1,15 @@
 from __future__ import unicode_literals
 
 from collections import deque
+from copy import deepcopy
 from functools import partial
 
 from django.db import models
+from django.core.paginator import Paginator
 from django.utils.six import add_metaclass, iteritems
-
 from elasticsearch.helpers import bulk, parallel_bulk
-from elasticsearch_dsl import DocType as DSLDocType
-from elasticsearch_dsl.document import DocTypeMeta as DSLDocTypeMeta
+from elasticsearch_dsl import Document as DSLDocument
 from elasticsearch_dsl.field import Field
-
 
 from .apps import DEDConfig
 from .exceptions import ModelFieldNotMappedError, RedeclaredFieldError
@@ -110,71 +109,7 @@ class PagingQuerysetProxy(object):
 
             current_qs = None  # I'm free!
 
-
-class DocTypeMeta(DSLDocTypeMeta):
-    def __new__(cls, name, bases, attrs):
-        """
-        Subclass default DocTypeMeta to generate ES fields from django
-        models fields
-        """
-        super_new = super(DocTypeMeta, cls).__new__
-
-        parents = [b for b in bases if isinstance(b, DocTypeMeta)]
-        if not parents:
-            return super_new(cls, name, bases, attrs)
-
-        meta = attrs['Meta']
-        model = meta.model
-
-        ignore_signals = getattr(meta, "ignore_signals", False)
-        auto_refresh = getattr(meta, 'auto_refresh', DEDConfig.auto_refresh_enabled())
-        model_field_names = getattr(meta, "fields", [])
-        related_models = getattr(meta, "related_models", [])
-        queryset_pagination = getattr(meta, "queryset_pagination", None)
-        parallel_indexing = getattr(meta, "parallel_indexing", False)
-
-        class_fields = set(
-            name for name, field in iteritems(attrs)
-            if isinstance(field, Field)
-        )
-
-        cls = super_new(cls, name, bases, attrs)
-
-        doc_type = cls._doc_type
-        doc_type.model = model
-        doc_type.ignore_signals = ignore_signals
-        doc_type.auto_refresh = auto_refresh
-        doc_type.related_models = related_models
-        doc_type.queryset_pagination = queryset_pagination
-        doc_type.parallel_indexing = parallel_indexing
-
-        fields = model._meta.get_fields()
-        fields_lookup = dict((field.name, field) for field in fields)
-
-        for field_name in model_field_names:
-            if field_name in class_fields:
-                raise RedeclaredFieldError(
-                    "You cannot redeclare the field named '{}' on {}"
-                    .format(field_name, cls.__name__)
-                )
-
-            field_instance = cls.to_field(field_name,
-                                          fields_lookup[field_name])
-            doc_type.mapping.field(field_name, field_instance)
-
-        doc_type._fields = (
-            lambda: doc_type.mapping.properties.properties.to_dict())
-
-        if getattr(doc_type, 'index'):
-            index = Index(doc_type.index)
-            index.doc_type(cls)
-            registry.register(index, cls)
-
-        return cls
-
-
-@add_metaclass(DocTypeMeta)
-class DocType(DSLDocType):
+class DocType(DSLDocument):
     def __init__(self, related_instance_to_ignore=None, **kwargs):
         super(DocType, self).__init__(**kwargs)
         self._related_instance_to_ignore = related_instance_to_ignore
@@ -188,25 +123,24 @@ class DocType(DSLDocType):
     @classmethod
     def search(cls, using=None, index=None):
         return Search(
-            using=using or cls._doc_type.using,
-            index=index or cls._doc_type.index,
+            using=cls._get_using(using),
+            index=cls._default_index(index),
             doc_type=[cls],
-            model=cls._doc_type.model
+            model=cls.django.model
         )
 
     def get_queryset(self):
         """
         Return the queryset that should be indexed by this doc type.
         """
-        return self._doc_type.model._default_manager.all()
+        return self.django.model._default_manager.all()
 
     def get_indexing_queryset(self):
         qs = self.get_queryset()
-        # Note: PagingQuerysetProxy handles the "no chunking" case,
-        #  but some tests check for the mock qs, so don't interfere.
-        #  We could remove this check/branch if the tests are adapted.
-        if self._doc_type.queryset_pagination is not None:
-            return PagingQuerysetProxy(qs, chunk_size=self._doc_type.queryset_pagination)
+        # Note: PagingQuerysetProxy handles no chunking, but some tests
+        # check for the qs, so don't interfere.
+        if self.django.queryset_pagination is not None:
+            return PagingQuerysetProxy(qs, chunk_size=self.django.queryset_pagination)
         return qs
 
     def init_prepare(self):
@@ -216,7 +150,7 @@ class DocType(DSLDocType):
         work on every object instance over.
         """
         fields = []
-        for name, field in self._doc_type._fields().items():
+        for name, field in iteritems(self._fields):
             if not isinstance(field, DEDField):
                 continue
 
@@ -249,6 +183,7 @@ class DocType(DSLDocType):
             name: prep_func(instance)
                 for name, field, prep_func in self._doc_type._prepared_fields
             }
+        # print("-> %s" % data)
         return data
 
     @classmethod
@@ -268,25 +203,17 @@ class DocType(DSLDocType):
             )
 
     def bulk(self, actions, **kwargs):
-        return bulk(client=self.connection, actions=actions, **kwargs)
+        return bulk(client=self._get_connection(), actions=actions, **kwargs)
 
     def parallel_bulk(self, actions, **kwargs):
-        deque(parallel_bulk(client=self.connection, actions=actions, **kwargs), maxlen=0)
+        deque(parallel_bulk(client=self._get_connection(), actions=actions, **kwargs), maxlen=0)
         return (1, [])  # Fake return value to emulate bulk(), not used upstream
-
-    def _bulk(self, *args, **kwargs):
-        """Helper for switching between normal and parallel bulk operation"""
-        parallel = kwargs.pop('parallel', False)
-        if parallel:
-            return self.parallel_bulk(*args, **kwargs)
-        else:
-            return self.bulk(*args, **kwargs)
 
     def _prepare_action(self, object_instance, action):
         return {
             '_op_type': action,
-            '_index': str(self._doc_type.index),
-            '_type': self._doc_type.mapping.doc_type,
+            '_index': self._index._name,
+            '_type': self._doc_type.name,
             '_id': object_instance.pk,
             '_source': (
                 self.prepare(object_instance) if action != 'delete' else None
@@ -297,12 +224,20 @@ class DocType(DSLDocType):
         for object_instance in object_list:
             yield self._prepare_action(object_instance, action)
 
+    def _bulk(self, *args, **kwargs):
+        """Helper for switching between normal and parallel bulk operation"""
+        parallel = kwargs.pop('parallel', False)
+        if parallel:
+            return self.parallel_bulk(*args, **kwargs)
+        else:
+            return self.bulk(*args, **kwargs)
+
     def update(self, thing, refresh=None, action='index', **kwargs):
         """
         Update each document in ES for a model, iterable of models or queryset
         """
         if refresh is True or (
-            refresh is None and self._doc_type.auto_refresh
+            refresh is None and self.django.auto_refresh
         ):
             kwargs['refresh'] = True
 
@@ -311,6 +246,8 @@ class DocType(DSLDocType):
         else:
             object_list = thing
 
-        return self._bulk(self._get_actions(object_list, action),
-            parallel=self._doc_type.parallel_indexing, **kwargs
+        return self._bulk(
+            self._get_actions(object_list, action),
+            parallel=self.django.parallel_indexing,
+            **kwargs
         )
